@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Ball Mastery</title>
+
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0b0f14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
+<style>
+  :root { --bg:#0b0f14; --glass:#10151bAA; --ink:#e7eef7; --pill:#17202a; --accent:#00c8ff; }
+  * { box-sizing: border-box }
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,Segoe UI,Arial}
+  #ui{position:fixed;left:0;right:0;bottom:0;background:var(--glass);backdrop-filter:blur(6px);
+      padding:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;z-index:20}
+  button,select,input[type=range]{font-size:14px}
+  button{padding:.55rem .8rem;border-radius:10px;border:1px solid #22303a;background:#121920;color:var(--ink)}
+  label{font-size:12px;opacity:.9;display:flex;align-items:center;gap:6px}
+  #hud{position:fixed;left:12px;top:10px;z-index:20;font-weight:600;text-shadow:0 2px 6px #000}
+  #wrap{position:fixed;inset:0;display:grid;place-items:center;background:#000}
+  canvas{max-width:100vw;max-height:100vh}
+  .pill{padding:.3rem .6rem;border-radius:999px;background:var(--pill);color:#cfe1ff;display:inline-block;margin-right:.4rem}
+  .hint{position:fixed;right:12px;top:10px;font-size:12px;opacity:.75}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="video" playsinline muted style="display:none"></video>
+  <canvas id="view"></canvas>
+</div>
+
+<div id="hud">
+  <span class="pill" id="score">Score: 0</span>
+  <span class="pill" id="time">Time: 45s</span>
+  <span class="pill" id="modepill">Mode: altLR</span>
+</div>
+<div class="hint">Tip: add to Home Screen for full screen</div>
+
+<div id="ui">
+  <button id="startBtn">Start Camera</button>
+  <button id="roundBtn">Start Round</button>
+  <select id="modeSel" aria-label="Mode">
+    <option value="altLR">Alternate L/R</option>
+    <option value="leftOnly">Left only</option>
+    <option value="rightOnly">Right only</option>
+    <option value="random">Random</option>
+  </select>
+  <label>Target
+    <input id="rad" type="range" min="30" max="140" value="80">
+  </label>
+  <label>H: <input id="hmin" type="range" min="0" max="360" value="20">
+           <input id="hmax" type="range" min="0" max="360" value="50"></label>
+  <label>S: <input id="smin" type="range" min="0" max="100" value="55">
+           <input id="smax" type="range" min="0" max="100" value="100"></label>
+  <label>V: <input id="vmin" type="range" min="0" max="100" value="45">
+           <input id="vmax" type="range" min="0" max="100" value="100"></label>
+</div>
+
+<script>
+/* ---------- Elements ---------- */
+const video = document.getElementById('video');
+const canvas = document.getElementById('view');
+const ctx = canvas.getContext('2d', { alpha:false, desynchronized:true });
+const startBtn = document.getElementById('startBtn');
+const roundBtn = document.getElementById('roundBtn');
+const modeSel  = document.getElementById('modeSel');
+const radEl    = document.getElementById('rad');
+const hudScore = document.getElementById('score');
+const hudTime  = document.getElementById('time');
+const modePill = document.getElementById('modepill');
+const sliders = ["hmin","hmax","smin","smax","vmin","vmax"].reduce((o,id)=> (o[id]=document.getElementById(id),o), {});
+
+/* ---------- HSV helpers ---------- */
+function hsvOK(h,s,v){
+  const H=[+sliders.hmin.value,+sliders.hmax.value], S=[+sliders.smin.value,+sliders.smax.value], V=[+sliders.vmin.value,+sliders.vmax.value];
+  // support wrap-around hue (e.g., 350..20)
+  if (H[0] <= H[1]) return (h>=H[0]&&h<=H[1] && s>=S[0]&&s<=S[1] && v>=V[0]&&v<=V[1]);
+  return ((h>=H[0]||h<=H[1]) && s>=S[0]&&s<=S[1] && v>=V[0]&&v<=V[1]);
+}
+function rgb2hsv(r,g,b){
+  r/=255; g/=255; b/=255;
+  const max=Math.max(r,g,b), min=Math.min(r,g,b), d=max-min;
+  let h=0;
+  if (d!==0){
+    switch(max){case r:h=(g-b)/d+(g<b?6:0);break;case g:h=(b-r)/d+2;break;default:h=(r-g)/d+4;}
+    h/=6;
+  }
+  const s = max===0 ? 0 : d/max;
+  return [h*360, s*100, max*100];
+}
+
+/* ---------- Game state ---------- */
+let W=1280, H=720;
+let running=false, timer=null, timeLeft=45, score=0, target={x:640,y:360,r:80};
+let mode="altLR", needLeft=true;
+let lastHitAt=0, debounceMs=320;
+let prev=null; // smoothed center
+
+function pick(min,max){ return Math.floor(Math.random()*(max-min+1))+min; }
+function newTarget(obey=true){
+  const r=target.r, margin=40+r;
+  const L=[margin, Math.floor(W*0.38)], R=[Math.floor(W*0.62), W-margin];
+  const y=pick(margin, H-margin);
+  if (!obey || mode==="random") target.x=pick(margin, W-margin);
+  else if (mode==="altLR"){ target.x = needLeft? pick(...L) : pick(...R); needLeft=!needLeft; }
+  else if (mode==="leftOnly"){ target.x=pick(...L); }
+  else if (mode==="rightOnly"){ target.x=pick(...R); }
+  target.y=y;
+}
+
+/* ---------- Detection ---------- */
+function detectCenter(imgData){
+  const step=4, w=imgData.width, h=imgData.height, d=imgData.data;
+  let sx=0, sy=0, c=0;
+  for (let y=0; y<h; y+=step){
+    for (let x=0; x<w; x+=step){
+      const i=(y*w+x)*4, [hh,ss,vv]=rgb2hsv(d[i],d[i+1],d[i+2]);
+      if (hsvOK(hh,ss,vv)){ sx+=x; sy+=y; c++; }
+    }
+  }
+  if (c<8) return null;
+  let cx=sx/c, cy=sy/c;
+  if (prev){ cx = 0.35*cx + 0.65*prev.x; cy = 0.35*cy + 0.65*prev.y; }
+  prev={x:cx,y:cy}; return prev;
+}
+
+/* ---------- Camera ---------- */
+async function startCamera(){
+  try{
+    const s = await navigator.mediaDevices.getUserMedia({
+      video:{ facingMode:"environment", width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:30,max:60} },
+      audio:false
+    });
+    video.srcObject = s; await video.play();
+    W=video.videoWidth||1280; H=video.videoHeight||720;
+    canvas.width=W; canvas.height=H;
+    running=true; loop();
+  }catch(e){ alert("Camera error: "+e.message); }
+}
+
+/* ---------- Render ---------- */
+function drawHUD(center){
+  ctx.fillStyle="#fff"; ctx.font="24px system-ui";
+  ctx.fillText(`Score:${score}`, 16, 30);
+  ctx.fillText(`Time:${timeLeft}s`, 160, 30);
+  ctx.strokeStyle="rgba(0,200,255,0.95)"; ctx.lineWidth=4;
+  ctx.beginPath(); ctx.arc(target.x,target.y,target.r,0,Math.PI*2); ctx.stroke();
+  if (center){ ctx.fillStyle="rgba(0,255,150,0.95)"; ctx.beginPath(); ctx.arc(center.x,center.y,7,0,Math.PI*2); ctx.fill(); }
+}
+function hitTest(center){
+  if (!center) return;
+  const dx=center.x-target.x, dy=center.y-target.y, dist=Math.hypot(dx,dy);
+  const now=performance.now();
+  if (dist<=target.r*0.95 && (now-lastHitAt)>debounceMs){
+    score++; lastHitAt=now; newTarget(true); hudScore.textContent=`Score: ${score}`;
+  }
+}
+function loop(){
+  if (!running) return;
+  ctx.drawImage(video,0,0,W,H);
+  const img = ctx.getImageData(0,0,W,H);
+  const center = detectCenter(img);
+  hitTest(center); drawHUD(center);
+  requestAnimationFrame(loop);
+}
+
+/* ---------- Round ---------- */
+function startRound(){
+  score=0; timeLeft=45; hudScore.textContent="Score: 0"; hudTime.textContent="Time: 45s";
+  target.r=+radEl.value; mode=modeSel.value; modePill.textContent=`Mode: ${mode}`;
+  needLeft=true; newTarget(true);
+  if (!running) startCamera();
+  if (timer) clearInterval(timer);
+  timer=setInterval(()=>{
+    timeLeft--; hudTime.textContent=`Time: ${timeLeft}s`;
+    if (timeLeft<=0){ clearInterval(timer); timer=null; alert(`Round complete! Score: ${score}`); }
+  },1000);
+}
+
+/* ---------- UI ---------- */
+startBtn.onclick=()=>{ if(!running) startCamera(); };
+roundBtn.onclick=startRound;
+modeSel.onchange=()=> (mode=modeSel.value, modePill.textContent=`Mode: ${mode}`, newTarget(true));
+radEl.oninput = ()=> (target.r=+radEl.value);
+
+/* ---------- PWA ---------- */
+if ('serviceWorker' in navigator){
+  window.addEventListener('load', ()=> navigator.serviceWorker.register('sw.js'));
+}
+</script>
+</body>
+</html>
